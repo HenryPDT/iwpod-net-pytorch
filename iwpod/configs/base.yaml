@@ -1,0 +1,35 @@
+# IWPOD-v2 training defaults (vehicle-crop input)
+seed: 42
+dim: 384            # train resolution (square, %32); multi-scale list below
+multi_scale: [320, 352, 384, 416, 448, 480]
+stride: 16
+side: 7.75         # ((208+40)/2)/16 — keep in sync with src/constants.py + DS parser
+epochs: 200
+batch_size: 32
+num_workers: 8
+lr: 0.001
+weight_decay: 0.0005
+warmup_epochs: 5
+scheduler: cosine   # cosine | none (per-iteration stepping; see TRAINING.md)
+min_lr_ratio: 0.05  # cosine tail floor = lr * ratio (YOLOX-style; 0.0 = decay to zero)
+use_amp: true
+use_ema: true
+ema_decay: 0.999
+grad_clip: 1.0
+loss:
+  w_cls: 1.0
+  w_dice: 0.5
+  w_loc: 1.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  ohem_neg_ratio: 3.0
+model:
+  raw_logits: true
+save_every: 10
+save_history_ckpt: false  # history off: keep last+best only (true = <name>_epoch<N>.pth every save_every epochs)
+print_interval: 10       # iters between per-iter log lines (YOLOX-style)
+eval_threshold: 0.3      # decode confidence for in-train geometric val
+eval_size: null          # val decode resolution (null = dim); fixed for stable IoU
+eval_sweep_every: 5      # epochs between threshold/F1 sweep reports (block logs every epoch)
+patience: 0              # early-stop epochs without improvement (0 = off); CLI --patience overrides
+# Validation: explicit ROOT/val/ (or nothing; then `_best.pth` tracks train loss).

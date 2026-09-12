@@ -1,0 +1,31 @@
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+#0=RGB, 1=BGR
+model-color-format=0
+batch-size=8
+# v2: dynamic ONNX, lpd_pred [B,7,Gh,Gw] (raw logits + affine) + passthrough.
+# Fixed deployment resolution on all platforms (multiple of 32):
+#   Xavier NX + Orin Nano/NX + x86: 3;416;416 (default below)
+infer-dims=3;416;416
+network-input-order=0
+onnx-file=/app/deepstream_src/models/iwpodv2_416_w_passthrough.onnx
+# network-mode=0 (FP32) for bring-up. Flip to 2 (FP16) only after validating
+# wpod_confidence histograms (<1pp shift) — see DOWNSTREAM_GUIDE.md §6.
+# NOTE: do NOT set symmetric-padding=1 here. LPR.cpp maps quads with
+#   scale=max(w/h ratios) + top-left offset (asymmetric letterbox math);
+#   symmetric padding would shift every quad by half the pad, uncompensated.
+network-mode=0
+num-detected-classes=1
+interval=0
+gie-unique-id=2
+process-mode=2
+network-type=100
+cluster-mode=4
+maintain-aspect-ratio=1
+output-tensor-meta=1
+# NOTE: network-type=100 = raw tensor output. No bbox parser lib is used;
+# decode happens in the nvdspreprocess custom plugin (see DOWNSTREAM_GUIDE.md
+# Phase 1). Do NOT add parse-bbox-func-name / custom-lib-path here.
+# Decode constants (stride=16, side=7.75, threshold=0.3, topk=1, nms=0.25)
+# are compile-time in nvdspreprocess_iwpod_impl.cpp — not runtime-tunable.

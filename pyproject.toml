@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iwpod-net-pytorch-v2"
+version = "2.0.0"
+description = "IWPOD-NET PyTorch (v2: dynamic export, modern loss, DeepStream-ready)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "albumentations",
+  "loguru",
+  "tensorboard",
+  "torch",
+  "numpy",
+  "opencv-python",
+  "pyyaml",
+  "tqdm",
+  "psutil",
+  "onnx",
+  "onnxscript",
+  "onnxruntime",
+  "onnxslim",
+  "pytest",
+]
+
+[project.optional-dependencies]
+cuda = ["onnxruntime-gpu"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+iwpod = "iwpod.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["iwpod*"]
+
+[tool.setuptools.package-data]
+iwpod = ["configs/*.yaml"]
+
+[tool.ruff]
+line-length = 120
+exclude = ["legacy/*"]
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "N", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["iwpod"]
+
+# Ported math-heavy modules keep their upstream naming (I, Y, l, FindX...);
+# everything else is enforced. B008 covers their np.array(...) defaults,
+# which are never mutated in practice — changing signatures is not worth it.
+[tool.ruff.lint.per-file-ignores]
+"iwpod/{sampler,utils,label,projection_utils,drawing_utils,network,loss}.py" = ["N", "E741", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -167,3 +167,14 @@ cython_debug/
 *.gz
 *.zip
 *.npz
+
+datasets/
+
+# iwpod: build artifacts (engines are per-machine, onnx exports are large)
+/out/
+*.engine
+*.onnx
+
+# iwpod: generated logs (eval appends val_log.txt next to weights)
+val_log.txt
+train.log
