@@ -20,6 +20,12 @@ iwpod train --data datasets/LP --epochs 50 --batch-size 16 --no-multiscale \
   --no-amp --no-ema --name debug
 # resume a run in place (no new dir) and extend the budget
 iwpod train --resume out/train/exp1 --epochs 300 --data datasets/LP
+# v3-s16 upgrades, no DeepStream change (drop-in single output)
+iwpod train --data datasets/LP --epochs 200 --batch-size 32 --lr 0.001 \
+  --arch v3 --name v3s16
+# same as --arch v3, written out (granular flags override the preset)
+iwpod train --data datasets/LP --epochs 200 --batch-size 32 --lr 0.001 \
+  --backbone rep --head dw --simam --detail-boost 0.5 --name v3s16
 ```
 
 ## Run directories (never overwritten)
@@ -53,6 +59,13 @@ configured size), `--grad-accum` (effective batch = batch-size × steps),
 `--weight-decay`, `--seed`, `--size` (square, sets `dim`), `--no-multiscale`,
 `--scheduler`, `--amp` / `--no-amp`, `--no-ema`, `--ema-decay`, `--warmup-epochs`,
 `--save-every` (implies history), `--save-history`, `--dry-run`, `--num-workers`.
+v3 preset: `--arch v2` (stock, default) | `v3` (rep backbone + DW-SimAM
+head + detail boosting, drop-in DeepStream).
+Granular overrides (beat the preset, resolved into `config.yaml`):
+`--backbone orig|rep`, `--head orig|dw`, `--simam` / `--no-simam`,
+`--detail-boost [0,1]`, `--w-cls/--w-dice/--w-loc`.
+(LPWing and copy-paste were removed after gate runs proved them worse;
+stale configs carrying those keys fail loud — see docs/V3.md.)
 Output: `--model-dir`, `--name`, `--config`
 (default: bundled `iwpod/configs/base.yaml`, works from any CWD),
 `--resume` (ckpt path or run dir).

@@ -12,8 +12,8 @@ NET_STRIDE = 16
 SIDE = ((208.0 + 40.0) / 2.0) / NET_STRIDE  # = 7.75
 ANCHOR_HALF = 0.5
 
-# Export / DeepStream alignment: multiples of 32 cover stride-16 +
-# TensorRT alignment + future FPN stride-32 head without re-export.
+# Export / DeepStream alignment: multiples of 32 cover the stride-16 grid
+# plus TensorRT alignment headroom.
 EXPORT_ALIGNMENT = 32
 EXPORT_MIN_SIZE = 256
 EXPORT_OPT_SIZE = 416  # Phase-1 Xavier NX infer-dims

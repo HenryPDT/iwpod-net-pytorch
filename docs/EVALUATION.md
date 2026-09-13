@@ -25,6 +25,7 @@ inside training every epoch — see TRAINING.md.)
 | `mAP@50` / `mAP@50-95` | area under the precision-recall curve at IoU>0.5 / mean over 0.5–0.95 (single class, so AP = mAP) | threshold-free ranking quality; **mAP@50-95 selects `_best.pth`** |
 | `IoU curve` | same fraction at 0.5–0.95 (console EVAL block; TB carries the COCO trio `val/map50-95` + `val/map50` + `val/map75`) | where accuracy falls off with strictness |
 | `RMSE_det` | RMS corner error in normalized [0,1] coords **over detections only**, with `rmse_n` | geometric precision for the warp (not overall accuracy) |
+| `LP-NME` | mean corner error / GT diagonal **over detections only** (Wei & Xie 2023), with `nme_n` | perspective-warp quality; tie-break after recall in `_best.pth` selection (see `docs/V3.md`) |
 | `infer ms/img` | forward + decode time per image | latency signal next to accuracy |
 
 ## How to read the numbers

@@ -74,6 +74,24 @@ def poly_area(qn):
                                for i in range(4))))
 
 
+def lp_nme(pred_qn, gt_qn):
+    """LP-NME: mean corner error / GT diagonal (Wei & Xie 2023, DPOD-NET).
+
+    Both quads are (2,4) in normalized [0,1] coords. Corner order is assumed
+    consistent (TL,TR,BR,BL per training convention); caller aligns via the
+    same warp order used for labels. Returns float; NaN if GT degenerate.
+    """
+    pred_qn = np.asarray(pred_qn, dtype=float)
+    gt_qn = np.asarray(gt_qn, dtype=float)
+    if pred_qn.shape != (2, 4) or gt_qn.shape != (2, 4):
+        return float("nan")
+    diag = float(np.linalg.norm(gt_qn[:, 0] - gt_qn[:, 2]))
+    if diag < 1e-9:
+        return float("nan")
+    err = float(np.sqrt(((pred_qn - gt_qn) ** 2).sum(axis=0)).mean())
+    return err / diag
+
+
 def entries_from_annotated_dir(data_dir):
     """(jpg, gt) pairs for a dir of image + sibling-.txt pairs (eval format).
 
@@ -148,8 +166,8 @@ def evaluate_quads(model, entries, size_px=384, threshold=0.3, device=None,
     model.eval()
     base_thr = min(threshold, BASE_THRESHOLD)
 
-    ious, rmses_det = [], []
-    confs, raw_ious, areas, is_pos, rmses_all = [], [], [], [], []
+    ious, rmses_det, nmes_det = [], [], []
+    confs, raw_ious, areas, is_pos, rmses_all, nmes_all = [], [], [], [], [], []
     dets = dets_pos = tp50 = fp = 0
     infer_ms_total = 0.0
     n = 0
@@ -185,6 +203,7 @@ def evaluate_quads(model, entries, size_px=384, threshold=0.3, device=None,
             areas.append(0.0)
             is_pos.append(False)
             rmses_all.append(float("nan"))
+            nmes_all.append(float("nan"))
             continue
         if found:
             quad, _c = found[0]
@@ -192,20 +211,24 @@ def evaluate_quads(model, entries, size_px=384, threshold=0.3, device=None,
             qn = q0 / np.array([[w0], [h0]])
             iou = quad_iou(qn, gt)
             rmse = float(np.sqrt(((qn - gt) ** 2).mean()))
+            nme = lp_nme(qn, gt)
             area = poly_area(gt)
         else:
-            iou, rmse, area = 0.0, 0.0, poly_area(gt)
+            iou, rmse, nme, area = 0.0, 0.0, float("nan"), poly_area(gt)
         confs.append(conf)
         raw_ious.append(iou)
         areas.append(area)
         is_pos.append(True)
         rmses_all.append(rmse)
+        nmes_all.append(nme)
         if conf >= threshold:
             dets += 1
             dets_pos += 1
             ious.append(iou)
             if found:
                 rmses_det.append(rmse)
+                if nme == nme:  # not NaN
+                    nmes_det.append(nme)
             if iou > 0.5:
                 tp50 += 1
         else:
@@ -222,6 +245,7 @@ def evaluate_quads(model, entries, size_px=384, threshold=0.3, device=None,
     curve = {t: float(np.mean(ious > t)) if n_pos else 0.0 for t in IOU_THRESHOLDS}
     maps = map_scores(confs, raw_ious, is_pos)
     rmse_detected = float(np.mean(rmses_det)) if rmses_det else 0.0
+    nme_detected = float(np.mean(nmes_det)) if nmes_det else 0.0
     extra = list(extra_thresholds or [])
     res = EvalResult(
         n=n, dets=dets, fp=fp,
@@ -237,6 +261,9 @@ def evaluate_quads(model, entries, size_px=384, threshold=0.3, device=None,
         rmse_detected=rmse_detected,
         rmse_n=int(len(rmses_det)),
         rmse=rmse_detected,  # alias
+        nme_detected=nme_detected,
+        nme_n=int(len(nmes_det)),
+        nme=nme_detected,  # alias (LP-NME, Wei & Xie 2023)
         infer_ms=float(infer_ms_total / max(1, n)),
         area=area_split(confs, ious, areas, is_pos, threshold),
         sweep=threshold_sweep(confs, raw_ious, is_pos, threshold, extra),
@@ -360,7 +387,8 @@ def format_summary(r, prefix="val"):
             f"mIoU={r['mean_iou']:.3f} {curve} "
             f"mAP@50={r['map50']:.3f} mAP@50-95={r['map']:.3f} "
             f"RMSE_det={r.get('rmse_detected', r['rmse']):.4f} "
-            f"(n={r.get('rmse_n', 0)}) infer={r['infer_ms']:.1f}ms/img")
+            f"(n={r.get('rmse_n', 0)}) LP-NME={r.get('nme_detected', r.get('nme', 0.0)):.4f} "
+            f"(n={r.get('nme_n', 0)}) infer={r['infer_ms']:.1f}ms/img")
 
 
 def format_block(r, epoch=None, epochs=None, size_px=None, threshold=None,
@@ -381,7 +409,8 @@ def format_block(r, epoch=None, epochs=None, size_px=None, threshold=None,
     lines = [bar, head, "-" * 70,
              f"recall={r['recall']:.3f}  det_rate={r.get('det_rate', r['recall']):.3f}  "
              f"mIoU={r['mean_iou']:.3f}  RMSE_det={r.get('rmse_detected', r['rmse']):.4f} "
-             f"(n={r.get('rmse_n', 0)})  dets={r['dets']}  fp_neg={r['fp']}  "
+             f"(n={r.get('rmse_n', 0)})  LP-NME={r.get('nme_detected', r.get('nme', 0.0)):.4f} "
+             f"(n={r.get('nme_n', 0)})  dets={r['dets']}  fp_neg={r['fp']}  "
              f"infer={r['infer_ms']:.1f}ms/img",
              f"mAP@50={r['map50']:.3f}  mAP@50-95={r['map']:.3f}",
              f"IoU: {curve}",

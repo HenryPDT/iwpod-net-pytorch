@@ -47,39 +47,31 @@ static inline double aabb_iou(double tlx1, double tly1, double brx1, double bry1
     return u > 1e-9 ? inter / u : 0.0;
 }
 
-// pred: raw output pointer (host). Layout selected by is_nchw:
-//   NCHW: [C,Gh,Gw], C==7 (logit + affine6). from_logits=1.
-//   NHWC legacy: [Gh,Gw,C], C==8 (prob + bg + affine6). from_logits=0.
-// in_w/in_h: SGIE input (infer-dims) in pixels. out_w/out_h: plate size (256x96).
-// Returns detection confidence (0.0 = none). tensor_output[0..3]=xs, [4..7]=ys
-// of the winning quad in vehicle-crop pixels (same contract as before).
-float reconstructIwpod(cv::Mat* output, float* tensor_output, const cv::Mat& image,
-                       const float* pred, int C, int Gh, int Gw, bool is_nchw,
-                       int in_w, int in_h, int out_w, int out_h, double net_stride,
-                       double side, double min_probability, bool from_logits,
-                       int topk, double nms_iou) {
-    // --- channel map -------------------------------------------------------
-    int conf_c, aff_c0;  // conf channel, first affine channel
+// --- grid-decoder internals ------------------------------------------------
+static const double kBase[3][4] = {
+    {-0.5, 0.5, 0.5, -0.5}, {-0.5, -0.5, 0.5, 0.5}, {1.0, 1.0, 1.0, 1.0}};
+
+// Decode one grid into scored quads (input-pixel space). Grid dims set the
+// MN normalization, so any stride-16 input size shares this code path.
+static void collectGrid(std::vector<ScoredQuad>& cands, const float* pred,
+                        int Gh, int Gw, bool is_nchw, int C,
+                        int in_w, int in_h, double side, double min_probability,
+                        bool from_logits) {
+    int conf_c, aff_c0;
     if (is_nchw && C == 7) {
         conf_c = 0;
         aff_c0 = 1;
     } else if (!is_nchw && C == 8) {
         conf_c = 0;
-        aff_c0 = 2;  // skip bg channel
+        aff_c0 = 2;  // skip bg channel (legacy NHWC)
     } else {
-        return 0.0f;  // unknown layout: refuse (fail-safe, no crash)
+        return;  // unknown layout: refuse (fail-safe, no crash)
     }
-    (void)net_stride;
     auto at = [&](int c, int y, int x) -> double {
         return is_nchw ? pred[(c * Gh + y) * Gw + x] : pred[(y * Gw + x) * C + c];
     };
-
-    static const double base[3][4] = {
-        {-0.5, 0.5, 0.5, -0.5}, {-0.5, -0.5, 0.5, 0.5}, {1.0, 1.0, 1.0, 1.0}};
     const double MNx = (double)Gw, MNy = (double)Gh;
     const double scale_gate = (double)std::max(in_w, in_h) / 400.0;  // old 30x10 @400px
-
-    std::vector<ScoredQuad> cands;
     for (int y = 0; y < Gh; ++y) {
         for (int x = 0; x < Gw; ++x) {
             double raw = at(conf_c, y, x);
@@ -92,12 +84,12 @@ float reconstructIwpod(cv::Mat* output, float* tensor_output, const cv::Mat& ima
             ScoredQuad q;
             bool neg = false;
             for (int j = 0; j < 4; ++j) {
-                const double rx = (A[0][0] * base[0][j] + A[0][1] * base[1][j] +
-                                   A[0][2] * base[2][j]) *
+                const double rx = (A[0][0] * kBase[0][j] + A[0][1] * kBase[1][j] +
+                                   A[0][2] * kBase[2][j]) *
                                           side +
                                   (x + 0.5);
-                const double ry = (A[1][0] * base[0][j] + A[1][1] * base[1][j] +
-                                   A[1][2] * base[2][j]) *
+                const double ry = (A[1][0] * kBase[0][j] + A[1][1] * kBase[1][j] +
+                                   A[1][2] * kBase[2][j]) *
                                           side +
                                   (y + 0.5);
                 q.qx[j] = rx / MNx * in_w;
@@ -120,6 +112,12 @@ float reconstructIwpod(cv::Mat* output, float* tensor_output, const cv::Mat& ima
             cands.push_back(q);
         }
     }
+}
+
+// AABB-NMS + warp of the winner. Returns 0.0 when nothing survives.
+static float selectAndWarp(cv::Mat* output, float* tensor_output, const cv::Mat& image,
+                           std::vector<ScoredQuad>& cands,
+                           int out_w, int out_h, int topk, double nms_iou) {
     if (cands.empty()) return 0.0f;
     std::sort(cands.begin(), cands.end(),
               [](const ScoredQuad& p, const ScoredQuad& q) { return p.conf > q.conf; });
@@ -168,6 +166,24 @@ float reconstructIwpod(cv::Mat* output, float* tensor_output, const cv::Mat& ima
     cv::warpPerspective(image, *output, H, cv::Size(out_w, out_h), cv::INTER_LINEAR,
                         cv::BORDER_CONSTANT, 0);
     return (float)best.conf;
+}
+
+// pred: raw output pointer (host). Layout selected by is_nchw:
+//   NCHW: [C,Gh,Gw], C==7 (logit + affine6). from_logits=1.
+//   NHWC legacy: [Gh,Gw,C], C==8 (prob + bg + affine6). from_logits=0.
+// in_w/in_h: SGIE input (infer-dims) in pixels. out_w/out_h: plate size (256x96).
+// Returns detection confidence (0.0 = none). tensor_output[0..3]=xs, [4..7]=ys
+// of the winning quad in vehicle-crop pixels (same contract as before).
+float reconstructIwpod(cv::Mat* output, float* tensor_output, const cv::Mat& image,
+                       const float* pred, int C, int Gh, int Gw, bool is_nchw,
+                       int in_w, int in_h, int out_w, int out_h, double net_stride,
+                       double side, double min_probability, bool from_logits,
+                       int topk, double nms_iou) {
+    (void)net_stride;  // grid dims already encode the stride (Gh=H/stride)
+    std::vector<ScoredQuad> cands;
+    collectGrid(cands, pred, Gh, Gw, is_nchw, C,
+                in_w, in_h, side, min_probability, from_logits);
+    return selectAndWarp(output, tensor_output, image, cands, out_w, out_h, topk, nms_iou);
 }
 
 }  // namespace iwpod

@@ -53,8 +53,12 @@ def run(args):
     ck = ckptlib.load_ckpt(args.weights, map_location="cpu")
     sd, arch = ckptlib.weights_and_arch(ck)
     from iwpod.model import IWPODNet
-    model = IWPODNet(raw_logits=True).to(device).eval()
-    model.load_state_dict(sd, strict=True)
+    _mkw = {}
+    for _k in ("backbone", "head", "use_simam", "arch_version"):
+        if arch.get(_k) is not None:
+            _mkw[_k] = arch[_k]
+    model = IWPODNet(raw_logits=True, **_mkw).to(device).eval()
+    ckptlib.load_state_dict_compat(model, sd, source=args.weights)
 
     if args.size is not None:
         if args.size % EXPORT_ALIGNMENT:
@@ -81,7 +85,8 @@ def run(args):
         t = torch.from_numpy(inp).permute(2, 0, 1).unsqueeze(0).to(device)
         with torch.no_grad():
             pred = model(t).squeeze(0).cpu().numpy()
-        found = decode_single(pred, size_px, size_px, threshold=args.threshold, from_logits=True, topk=1)
+        found = decode_single(pred, size_px, size_px, threshold=args.threshold,
+                              from_logits=True, topk=1)
         base = os.path.splitext(os.path.basename(f))[0]
         if not found:
             open(os.path.join(out_dir, base + "_quad.txt"), "w").write("none\n")

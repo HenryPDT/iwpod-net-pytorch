@@ -81,8 +81,12 @@ def run(args):
         raise RuntimeError(f"Export size must be multiple of {args.align}: got {exp_h}x{exp_w}")
 
     raw_logits = not args.with_sigmoid
-    model = IWPODNet(raw_logits=raw_logits)
     sd, arch = ckptlib.load_ckpt_weights(args.weights, map_location="cpu")
+    _mkw = dict(raw_logits=raw_logits)
+    for _k in ("backbone", "head", "use_simam", "arch_version"):
+        if arch.get(_k) is not None:
+            _mkw[_k] = arch[_k]
+    model = IWPODNet(**_mkw)
     for k, want in (("stride", NET_STRIDE), ("side", SIDE)):
         if arch.get(k) is not None and abs(float(arch[k]) - want) > 1e-9:
             raise RuntimeError(
@@ -91,7 +95,7 @@ def run(args):
     if arch.get("dim") is not None and (exp_h != arch["dim"] or exp_w != arch["dim"]):
         print(f"Note: exporting at {exp_h}x{exp_w}, trained at dim={arch['dim']} "
               f"(grid scales as H/16 x W/16; deploy size is {DEPLOY_SIZE})")
-    model.load_state_dict(sd, strict=True)
+    ckptlib.load_state_dict_compat(model, sd, source=args.weights)
     for p_ in model.parameters():
         p_.requires_grad = False
     model.eval().float()
@@ -117,12 +121,15 @@ def run(args):
         if args.dynamic_shape:
             dyn["input"][2] = "height"
             dyn["input"][3] = "width"
-        dyn[out_name] = {}
-        if args.dynamic:
-            dyn[out_name][0] = "batch"
-        if args.dynamic_shape:
-            dyn[out_name][2] = "h_out"
-            dyn[out_name][3] = "w_out"
+        for _on in out_names:
+            if _on == "pass_through_output":
+                continue
+            dyn[_on] = {}
+            if args.dynamic:
+                dyn[_on][0] = "batch"
+            if args.dynamic_shape:
+                dyn[_on][2] = "h_out"
+                dyn[_on][3] = "w_out"
         if args.with_passthrough:
             dyn["pass_through_output"] = dict(dyn["input"])
 

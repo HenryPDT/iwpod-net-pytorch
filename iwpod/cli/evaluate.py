@@ -48,8 +48,12 @@ def run(args):
     ck = ckptlib.load_ckpt(args.weights, map_location="cpu")
     sd, arch = ckptlib.weights_and_arch(ck)
     size_px = _resolve_size(args, arch)
-    model = IWPODNet(raw_logits=True).to(device).eval()
-    model.load_state_dict(sd, strict=True)
+    _mkw = {}
+    for _k in ("backbone", "head", "use_simam", "arch_version"):
+        if arch.get(_k) is not None:
+            _mkw[_k] = arch[_k]
+    model = IWPODNet(raw_logits=True, **_mkw).to(device).eval()
+    ckptlib.load_state_dict_compat(model, sd, source=args.weights)
 
     entries = entries_from_annotated_dir(args.data)
     if not entries:

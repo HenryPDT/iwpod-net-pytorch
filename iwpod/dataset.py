@@ -81,7 +81,7 @@ def estimate_cache_gb(entries, samples=32):
 
 class ALPRDataset(Dataset):
     def __init__(self, data_path=None, dim=208, stride=16, scales=None, entries=None,
-                 cache=None):
+                 cache=None, detail_boost=0.0):
         """cache: None (lazy reads, default — safe on any RAM size) or "ram".
 
         "ram" preloads all decoded images (fastest on a training server;
@@ -90,6 +90,7 @@ class ALPRDataset(Dataset):
         """
         self.dim = dim
         self.stride = stride
+        self.detail_boost = float(detail_boost)
         # Active resolution for dataset-level multi-scale (train loop sets
         # .scale per epoch so every batch stacks; None == self.dim).
         self.scale = None
@@ -133,7 +134,8 @@ class ALPRDataset(Dataset):
         d = self.scale or self.dim
         img = self._read(index)
         shapes = self.data[index][1]
-        aug, llp, ptslist = augment_sample(img, shapes, d)
+        aug, llp, ptslist = augment_sample(
+            img, shapes, d, detail_boost=self.detail_boost)
         y = labels2output_map(llp, ptslist, d, self.stride, alpha=0.5)
 
         inputs = torch.from_numpy(aug).permute(2, 0, 1).float()

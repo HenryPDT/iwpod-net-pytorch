@@ -23,8 +23,16 @@ loss:
   focal_alpha: 0.25
   focal_gamma: 2.0
   ohem_neg_ratio: 3.0
+  # Corner loss is Wing (see iwpod/loss.py:wing_loss). LPWing was removed after
+  # gate runs proved it worse at every constant weight (docs/V3.md).
 model:
   raw_logits: true
+  arch_version: v2     # v2 | v3-s16 (stamped in ckpt, checked on export)
+  backbone: orig       # orig | rep (reparam 3x3, same infer ops)
+  head: orig           # orig | dw (depthwise-separable + optional SimAM)
+  use_simam: false
+augment:
+  detail_boost: 0.0    # 0=off; 0.5 = per-sample plate-scale jitter amplitude (DPOD-style)
 save_every: 10
 save_history_ckpt: false  # history off: keep last+best only (true = <name>_epoch<N>.pth every save_every epochs)
 print_interval: 10       # iters between per-iter log lines (YOLOX-style)

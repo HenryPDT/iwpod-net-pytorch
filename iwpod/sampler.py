@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from loguru import logger
 
-from .constants import HSV_H_DELTA, HSV_S_DELTA, HSV_V_DELTA, IMAGE_EXTS, SIDE, is_real_plate
+from .constants import HSV_H_DELTA, HSV_S_DELTA, HSV_V_DELTA, IMAGE_EXTS, SIDE, is_real_plate, normalize_quad_order
 from .label import Label
 from .projection_utils import find_T_matrix, getRectPts, perspective_transform
 from .utils import getWH, hsv_transform, im2single
@@ -147,7 +147,13 @@ def labels2output_map(labelist, lpptslist, dim, stride, alpha=0.75):
     #  Scans all annotated LPs in the image
     #
     for i in range(0, len(labelist)):
-        lppts = lpptslist[i]
+        # Belt-and-braces TL-first: annotation/fit order is arbitrary, but the
+        # affine targets, decode and warp all assume TL,TR,BR,BL. Export
+        # normalizes too (X-AnyLabeling custom_to_wpod); this covers
+        # hand-written or third-party files. No-op on compliant quads.
+        # Clip to [0,1]: edge plates have true corners outside the frame;
+        # training targets the visible extent (mirrors exporter clamping).
+        lppts = np.clip(normalize_quad_order(lpptslist[i]), 0.0, 1.0)
         label = labelist[i]
         tlx, tly = np.floor(np.maximum(label.tl(), 0.) * MN).astype(int).tolist()
         brx, bry = np.ceil(np.minimum(label.br(), 1.) * MN).astype(int).tolist()
@@ -352,7 +358,8 @@ def _sample_angles(maxangle=None, maxsum=None):
     return limit_angles(angles, maxsum)
 
 
-def augment_sample(I, shapelist, dim, maxangle=None, maxsum=None):
+def augment_sample(I, shapelist, dim, maxangle=None, maxsum=None,
+                   detail_boost=0.0):
     #
     #  Main augmentation function. Generates an augmented version
     #  of input image I and the corresponding LP corners given in shapelist
@@ -421,8 +428,14 @@ def augment_sample(I, shapelist, dim, maxangle=None, maxsum=None):
 
         #
         #  Defines range of LP widths w.r.t to baseline resolution dim0 = 208
+        #  detail_boost (DPOD-style): per-sample extra scale jitter so small /
+        #  detailed plates are oversampled, e.g. 0.5 = ±50% on wsiz.
         #
         wsiz = random.uniform(dim0*0.2, dim0*1.0)
+        if detail_boost and detail_boost > 0:
+            wsiz = float(np.clip(
+                wsiz * random.uniform(1.0 - detail_boost, 1.0 + detail_boost),
+                dim0 * 0.1, float(dim)))
 
         #
         #  Defines height based on width and aspect ratio

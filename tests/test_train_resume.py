@@ -129,3 +129,36 @@ def test_evaluate_size_defaults_to_ckpt_dim():
         assert "multiple of" in str(e)
     else:
         raise AssertionError("expected RuntimeError")
+
+
+def test_resume_inherits_run_config_snapshot(tmp_path):
+    """`--resume <run-dir>` must rebuild the v3 model from the run snapshot,
+    not base defaults (regression: v3 resume crashed on arch mismatch)."""
+    import yaml
+
+    from iwpod.cli.train import _inherited_config_path, apply_cli_overrides, load_cfg
+    run_dir = tmp_path / "lpr_v3_gate"
+    run_dir.mkdir()
+    snap = load_cfg(default_config_path())
+    snap["model"]["backbone"] = "rep"
+    snap["model"]["arch_version"] = "v3-s16"
+    with open(run_dir / "config.yaml", "w") as f:
+        yaml.safe_dump(snap, f)
+    ap = _parser()
+
+    got = _inherited_config_path(ap.parse_args(["--resume", str(run_dir)]), None, str(run_dir))
+    assert got == str(run_dir / "config.yaml")
+    cfg = load_cfg(got)
+    apply_cli_overrides(cfg, ap.parse_args(["--resume", str(run_dir)]))
+    assert cfg["model"]["backbone"] == "rep"
+    assert cfg["model"]["arch_version"] == "v3-s16"
+
+    # explicit --config wins outright
+    got2 = _inherited_config_path(
+        ap.parse_args(["--resume", str(run_dir), "--config", default_config_path()]),
+        None, str(run_dir))
+    assert got2 == default_config_path()
+
+    # no snapshot anywhere -> default
+    got3 = _inherited_config_path(ap.parse_args([]), None, None)
+    assert got3 == default_config_path()

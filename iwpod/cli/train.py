@@ -81,6 +81,27 @@ def register(p):
     train_g.add_argument("--save-history", dest="save_history", action="store_true", default=None,
                          help="Keep <name>_epoch<N>.pth history (default from config)")
     train_g.add_argument("--num-workers", type=int, default=None)
+    train_g.add_argument("--w-cls", type=float, default=None,
+                         help="Focal-loss weight (default from config)")
+    train_g.add_argument("--w-dice", type=float, default=None,
+                         help="Dice-loss weight (default from config)")
+    train_g.add_argument("--w-loc", type=float, default=None,
+                         help="Corner-loss weight (default from config)")
+    v3_g = p.add_argument_group("v3 architecture", "Preset: --arch v2|v3 (details: docs/V3.md)")
+    v3_g.add_argument("--arch", choices=["v2", "v3"], default=None,
+                      help="Preset bundle: v2 = original (default); v3 = rep backbone + "
+                           "DW-SimAM head + detail boosting, drop-in DeepStream. "
+                           "Granular flags below override the preset")
+    v3_g.add_argument("--backbone", choices=["orig", "rep"], default=None,
+                      help="Override: orig = v2 dense convs; rep = RepVGG reparam")
+    v3_g.add_argument("--head", choices=["orig", "dw"], default=None,
+                      help="Override: orig = v2 dense head; dw = depthwise-separable head")
+    v3_g.add_argument("--simam", dest="simam", action="store_true", default=None,
+                      help="Override: enable parameter-free SimAM attention in the head")
+    v3_g.add_argument("--no-simam", dest="simam", action="store_false", default=None,
+                      help="Override: disable SimAM attention")
+    v3_g.add_argument("--detail-boost", type=float, default=None, metavar="AMT",
+                      help="Override: per-sample plate-scale jitter, e.g. 0.5 = ±50%% (0 = off)")
     out_g = p.add_argument_group("output", "Run directory")
     out_g.add_argument("--model-dir", default="out/train",
                        help="Base run dir (default out/train); run = <base>/<name>[_2..]")
@@ -189,6 +210,58 @@ def apply_cli_overrides(cfg, args):
         cfg["patience"] = args.patience
     if args.grad_accum is not None:
         cfg["grad_accum"] = args.grad_accum
+    for _k, _a in (("w_cls", "w_cls"), ("w_dice", "w_dice"), ("w_loc", "w_loc")):
+        _v = getattr(args, _a, None)
+        if _v is not None:
+            if _v < 0:
+                raise RuntimeError(f"--{_a} must be non-negative, got {_v}")
+            cfg.setdefault("loss", {})[_k] = float(_v)
+    # Preset bundles (granular flags win over the preset, preset wins over YAML).
+    # v3 = rep backbone + DW-SimAM head + detail boosting on the proven Wing
+    # loss. LPWing is deliberately NOT in the preset: measured 15x smaller
+    # gradients than Wing on real val batches, it starves corners at w_loc=1
+    # and distorts shared features at w_loc=12 (gate runs lpr_v3/gate_loss) —
+    # it needs a schedule, not a constant. Copy-paste is off (correlated with
+    # doubled FPs, never isolated). Override anything with granular flags.
+    _PRESETS = {
+        "v2": dict(backbone="orig", head="orig", use_simam=False,
+                   detail_boost=0.0),
+        "v3": dict(backbone="rep", head="dw", use_simam=True,
+                   detail_boost=0.5),
+    }
+    _preset = _PRESETS.get(getattr(args, "arch", None) or "")
+    model_cfg = cfg.setdefault("model", {})
+    aug_cfg = cfg.setdefault("augment", {})
+    if _preset is not None:
+        if getattr(args, "backbone", None) is None:
+            model_cfg["backbone"] = _preset["backbone"]
+        if getattr(args, "head", None) is None:
+            model_cfg["head"] = _preset["head"]
+        if getattr(args, "simam", None) is None:
+            model_cfg["use_simam"] = _preset["use_simam"]
+        if getattr(args, "detail_boost", None) is None:
+            aug_cfg["detail_boost"] = _preset["detail_boost"]
+    if getattr(args, "backbone", None) is not None:
+        model_cfg["backbone"] = args.backbone
+    if getattr(args, "head", None) is not None:
+        model_cfg["head"] = args.head
+    if getattr(args, "simam", None) is not None:
+        model_cfg["use_simam"] = bool(args.simam)
+    v3_flags_given = any([getattr(args, "arch", None) is not None,
+                          getattr(args, "backbone", None) is not None,
+                          getattr(args, "head", None) is not None,
+                          getattr(args, "simam", None) is not None])
+    if getattr(args, "arch", None) == "v2":
+        # Explicit reset to stock v2.
+        model_cfg["arch_version"] = "v2"
+    elif model_cfg.get("arch_version", "v2") == "v2" and (
+            v3_flags_given or model_cfg.get("backbone", "orig") != "orig" or
+            model_cfg.get("head", "orig") != "orig" or model_cfg.get("use_simam", False)):
+        model_cfg["arch_version"] = "v3-s16"
+    if getattr(args, "detail_boost", None) is not None:
+        if not 0.0 <= args.detail_boost <= 1.0:
+            raise RuntimeError(f"--detail-boost must be in [0, 1], got {args.detail_boost}")
+        aug_cfg["detail_boost"] = float(args.detail_boost)
     return cfg["epochs"], cfg["batch_size"], cfg["lr"], cfg.get("seed", 42)
 
 
@@ -224,6 +297,23 @@ def validate_config(cfg):
     for k in ("w_cls", "w_dice", "w_loc"):
         if loss.get(k, 1.0) < 0:
             raise RuntimeError(f"loss.{k} must be non-negative")
+    if loss.get("loc_type", "wing") != "wing":
+        raise RuntimeError(
+            f"loss.loc_type={loss.get('loc_type')!r} was removed: LPWing convicted "
+            f"(starves corners at w_loc=1, distorts features at w_loc=12). "
+            f"Delete the key to use Wing.")
+    model = cfg.get("model", {})
+    if model.get("backbone", "orig") not in ("orig", "rep"):
+        raise RuntimeError(f"model.backbone must be orig|rep, got {model.get('backbone')}")
+    if model.get("head", "orig") not in ("orig", "dw"):
+        raise RuntimeError(f"model.head must be orig|dw, got {model.get('head')}")
+    aug = cfg.get("augment", {})
+    if "copy_paste_p" in aug:
+        raise RuntimeError(
+            "augment.copy_paste_p was removed: copy-paste correlated with doubled "
+            "false positives and was never isolated. Delete the key.")
+    if not 0.0 <= float(aug.get("detail_boost", 0.0)) <= 1.0:
+        raise RuntimeError(f"augment.detail_boost must be in [0, 1], got {aug.get('detail_boost')}")
 
 
 def _harden_cv2_threads():
@@ -411,8 +501,7 @@ def train_one_epoch(model, ema, ema_state, loader, opt, scaler, lr_fn, cfg, devi
         iters_done += 1
         inputs, labels = inputs.to(device), labels.to(device)
         with torch.amp.autocast("cuda", enabled=bool(cfg.get("use_amp") and use_cuda)):
-            out = model(inputs)
-            result = iwpodnet_loss_v2(labels, out, **lkw)
+            result = iwpodnet_loss_v2(labels, model(inputs), **lkw)
             loss = result.total.mean() / accum
         scaler.scale(loss).backward()
         is_step = ((step_i + 1) % accum == 0) or ((step_i + 1) == n_iters)
@@ -516,8 +605,31 @@ def tb_epoch_tags():
     ]
 
 
+def _inherited_config_path(args, resume_ckpt, resume_dir):
+    """Config snapshot to inherit on resume (run's own config.yaml).
+
+    Without this, `--resume` rebuilds the model from base defaults and any
+    v3 run crashes loading its weights (arch mismatch). Explicit `--config`
+    always wins; otherwise prefer the run's snapshot, else the default.
+    """
+    if getattr(args, "config", None):
+        return args.config
+    cand = None
+    if resume_dir:
+        cand = os.path.join(resume_dir, "config.yaml")
+    elif resume_ckpt:
+        cand = os.path.join(os.path.dirname(os.path.abspath(resume_ckpt)), "config.yaml")
+    if cand and os.path.isfile(cand):
+        return cand
+    return default_config_path()
+
+
 def run(args):
-    cfg = load_cfg(args.config or default_config_path())
+    resume_ckpt, resume_dir = resolve_resume(args.resume)
+    cfg = load_cfg(_inherited_config_path(args, resume_ckpt, resume_dir))
+    if (resume_ckpt or resume_dir) and not getattr(args, "config", None):
+        logger.info("Resuming: inherited config from the run snapshot "
+                    "(CLI flags still override; --config <file> wins outright)")
     yaml_bs = cfg["batch_size"]
     epochs, bs, lr, seed = apply_cli_overrides(cfg, args)
     validate_config(cfg)
@@ -525,7 +637,6 @@ def run(args):
     _set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    resume_ckpt, resume_dir = resolve_resume(args.resume)
     if resume_dir and args.model_dir != "out/train":
         raise RuntimeError(
             "--resume <run-dir> continues in place inside that dir, so "
@@ -557,14 +668,21 @@ def run(args):
 
     from iwpod.model import IWPODNet
 
-    model = IWPODNet(raw_logits=cfg["model"].get("raw_logits", True)).to(device)
+    _mcfg = cfg.get("model") or {}
+    model = IWPODNet(raw_logits=_mcfg.get("raw_logits", True),
+                     backbone=_mcfg.get("backbone", "orig"),
+                     head=_mcfg.get("head", "orig"),
+                     use_simam=bool(_mcfg.get("use_simam", False)),
+                     arch_version=_mcfg.get("arch_version")).to(device)
     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=cfg.get("weight_decay", 5e-4))
 
     train_entries, val_entries = resolve_data(args)
     dim = cfg["dim"]
     loss_cfg = cfg.get("loss") or {}
+    aug_cfg = cfg.get("augment") or {}
     scales = [s for s in cfg.get("multi_scale", [dim]) if s % 32 == 0] or [dim]
-    train_ds = ALPRDataset(dim=dim, entries=train_entries, cache=args.cache)
+    train_ds = ALPRDataset(dim=dim, entries=train_entries, cache=args.cache,
+                           detail_boost=float(aug_cfg.get("detail_boost", 0.0)))
     use_cuda = device.type == "cuda"
     nw = cfg.get("num_workers", 8)
 
@@ -581,7 +699,12 @@ def run(args):
         train_ds.scale = None
         def _model_fn():
             from iwpod.model import IWPODNet as _Net
-            return _Net(raw_logits=cfg["model"].get("raw_logits", True))
+            _m = cfg.get("model") or {}
+            return _Net(raw_logits=_m.get("raw_logits", True),
+                        backbone=_m.get("backbone", "orig"),
+                        head=_m.get("head", "orig"),
+                        use_simam=bool(_m.get("use_simam", False)),
+                        arch_version=_m.get("arch_version"))
 
         def _loss_fn(out, tg):
             return iwpodnet_loss_v2(tg, out, **loss_kwargs(loss_cfg)).total.mean()
@@ -649,7 +772,7 @@ def run(args):
     if resume_ckpt and os.path.isfile(resume_ckpt):
         ck = ckptlib.load_ckpt(resume_ckpt, map_location=device)
         _sd, _arch = ckptlib.weights_and_arch(ck)
-        model.load_state_dict(_sd)
+        ckptlib.load_state_dict_compat(model, _sd, source=resume_ckpt)
         opt.load_state_dict(ck.get("optimizer_state_dict", opt.state_dict()))
         # CLI --weight-decay must survive resume (load_state_dict overwrites it).
         # YAML-only weight_decay is left as stored in the optimizer.
