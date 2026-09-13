@@ -22,11 +22,12 @@ from torch.utils.data import DataLoader
 
 from iwpod import ckpt as ckptlib
 from iwpod import runs
-from iwpod.constants import IMAGE_EXTS, NET_STRIDE, SIDE
+from iwpod.constants import NET_STRIDE, SIDE
 from iwpod.dataset import ALPRDataset, image_label_loader
 from iwpod.eval_core import entries_from_loader_entries, evaluate_quads, format_block
 from iwpod.loss import iwpodnet_loss_v2
 from iwpod.meters import MeterBuffer, gpu_mem_usage, host_mem_usage
+from iwpod.utils import image_files_from_folder
 
 
 def register(p):
@@ -102,12 +103,7 @@ def load_cfg(path):
 
 
 def _has_images(d):
-    if not os.path.isdir(d):
-        return False
-    for name in os.listdir(d):
-        if name.lower().endswith(IMAGE_EXTS):
-            return True
-    return False
+    return bool(image_files_from_folder(d))
 
 
 def _autodetect_data_root():

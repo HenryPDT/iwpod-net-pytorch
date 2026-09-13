@@ -43,7 +43,8 @@ Each run dir contains:
 
 ## CLI flags (override the YAML)
 
-Data: `--data` (root with `train/`+`val/`; defaults to `./datasets` when
+Data: `--data` (root with `train/`+`val/`, which may contain scene
+subfolders; defaults to `./datasets` when
 populated, else legacy `--train-dir` (trains with no val set). Training: `--epochs`, `--batch-size`
 (`-1` = probe VRAM for the max fitting batch, yolox-style; CPU keeps the
 configured size), `--grad-accum` (effective batch = batch-size × steps),

@@ -6,7 +6,8 @@ iwpod eval --weights out/train/exp1/exp1_best.pth --data datasets/LP/val \
 ```
 
 (`--data` uses the
-same image+sibling-`.txt` format as training — see DATASET.md. Inputs are
+same image+sibling-`.txt` format as training, including scene subfolders
+under `val/` — see DATASET.md. Inputs are
 letterboxed like DeepStream (top-left, black pad; `maintain-aspect-ratio=1`
 without `symmetric-padding`) and compared in original normalized coords.
 Results append to `val_log.txt` under `out/eval/<weights-stem>/` (override

@@ -25,16 +25,14 @@ conda env create -f environment.yml
 conda activate iwpodnet
 ```
 
-This installs the `iwpod` command (`prepare-data | train | eval | infer | export`
+This installs the `iwpod` command (`train | eval | infer | export`
 subcommands; `python -m iwpod ...` works too).
 
 ## Quickstart (end to end)
 
 ```bash
 uv venv && source .venv/bin/activate && uv pip install -e .
-# 0. raw scene folders -> train/val layout (per-scene 80/20, see docs/DATASET.md)
-iwpod prepare-data --input datasets/LP --output datasets/LPR
-# 1. train
+# train/val split is prepared externally (scene subfolders under train/ and val/; see docs/DATASET.md)
 iwpod train --data datasets/LPR --epochs 200 --batch-size 32 --lr 0.001 \
   --size 384 --seed 42 --name exp1
 iwpod eval --weights out/train/exp1/exp1_best.pth --data datasets/LPR/val \
@@ -75,8 +73,9 @@ Runs land in `out/train/<name>[_2..]` with checkpoints, `train_command.txt`,
 iwpod train --data datasets/LPR --epochs 200 --batch-size 32 --lr 0.001 --name exp1
 ```
 
-`--data` points at a root containing `train/` **and** `val/` (prepare the
-80/20 split in the dataset — training will not split for you). Runs go to
+`--data` points at a root containing `train/` **and** `val/` (scene
+subfolders under those splits are walked recursively; training will not
+split for you). Runs go to
 `out/train/<name>[_2..]`. Details and the bundled-config reference:
 `docs/TRAINING.md`. Legacy scripts live frozen in `legacy/` (reproduction only).
 

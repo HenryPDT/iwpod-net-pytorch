@@ -6,16 +6,23 @@ auto-detection.
 
 ## Layout
 
-A dataset directory contains image + sibling annotation pairs sharing a basename:
+A dataset directory contains image + sibling annotation pairs sharing a
+basename. Discovery is **recursive**: pairs may sit directly in the folder or
+one scene-subfolder down (or deeper). Scene folder names are ignored — only
+the image and the `.txt` next to it matter.
 
 ```
 train_dir/
-  000001.jpg
-  000001.txt
-  000002.jpg
-  000002.txt
+  Access_Control/
+    Access_Control_..._car_0.jpg
+    Access_Control_..._car_0.txt
+  Cahill_Entry_Front/
+    Cahill_Entry_Front_..._detected_0.jpg
+    Cahill_Entry_Front_..._detected_0.txt
   ...
 ```
+
+A flat folder (`train_dir/*.jpg` + sibling `*.txt`) is also valid.
 
 Supported image extensions: `.jpg`, `.jpeg`, `.png` (case-insensitive; see
 `iwpod/utils.py:image_files_from_folder`). Every image should have a `.txt`
@@ -88,51 +95,14 @@ Training resolution comes from the bundled config (`dim`, default 384).
 stride-16 network, TensorRT alignment, and the export contract). The output
 grid is always `dim/16` per side (e.g. 384 → 24×24).
 
-## Preparing raw scene folders (`iwpod prepare-data`)
-
-Raw collections usually arrive as scene folders (camera runs, collection
-batches) with no train/val split:
-
-```
-datasets/LP/
-├── train_wpod_01_12_23/   # scene: *.jpg + sibling *.txt
-├── train_wpod_12_10_23/   # scene
-└── ...
-```
-
-Convert once into the layout above:
-
-```bash
-iwpod prepare-data --input datasets/LP --output datasets/LPR --ratio 0.8 --seed 42
-iwpod train --data datasets/LPR --epochs 200 --batch-size 32 --name lpr_exp1
-```
-
-What it does:
-- Walks `--input` recursively — every directory holding images is one scene
-  (flat or nested, doesn't matter).
-- Splits **each scene independently** (seeded shuffle; default 80/20 train/val
-  via `--ratio 0.8`), so small scenes land in both splits proportionally instead
-  of being swallowed whole into one side. Scene ids are the path relative to
-  `--input` with `/` replaced by `__` (avoids `a/X` vs `b/X` collisions).
-  Tiny scenes (N≥2) keep at least one val sample by design.
-- Validates every pair: image readable; quad parseable (4 corners; pixel
-  coords auto-normalized; **reordered to TL,TR,BR,BL**; out-of-range rejected
-  and counted, not fatal).
-  Empty/missing `.txt` is kept as a background sample. Output `.txt` files
-  are canonicalized (normalized, 6 decimals, vehicle labels preserved) and
-  the split applies to validated pairs only.
-- Writes `<output>/{train,val}/` + `split_manifest.csv` (`file,scene,split`).
-  Files are always **copied**; the source tree is never modified.
-  Refuses an existing `--output` unless `--overwrite`.
-- No `--output` given → `<input>_prepared` next to the input.
-
 ## Train/val layout (the convention)
 
 The loader is lazy (images stay on disk until sampled), so 9k+ image
 datasets load in seconds with flat memory — verified on 7,395 crops.
 
+Prepare the train/val split **externally** (this repo does not split for you).
 Datasets live as **named folders** inside `datasets/`, each with `train/` and
-`val/` splits you prepare yourself (80/20 is the convention):
+`val/` trees. Scene subfolders under those splits are the usual layout:
 
 ```bash
 iwpod train --data datasets/LPR --epochs 200 --batch-size 32 --lr 0.001 --name exp1
@@ -144,14 +114,18 @@ with:
 datasets/
 └── LPR/
     ├── train/
-    │   ├── sample_001.jpg
-    │   ├── sample_001.txt
-    │   └── ...
+    │   ├── Access_Control/
+    │   │   ├── sample_001.jpg
+    │   │   ├── sample_001.txt
+    │   │   └── ...
+    │   └── Cahill_Entry_Front/
+    │       └── ...
     └── val/
-        ├── sample_101.jpg
-        ├── sample_101.txt
+        ├── Access_Control/
         └── ...
 ```
+
+Pairs may also sit directly in `train/` / `val/` with no scene folders.
 
 - If `datasets/` holds exactly one such named dataset, `--data` can be
   omitted — it is picked up automatically.
@@ -159,5 +133,6 @@ datasets/
   train/val split is dataset preparation, not training.
 - The legacy `--train-dir` bare-pairs path trains with no val set at all
   (warns; `_best.pth` tracks train loss).
-- `iwpod eval --data datasets/LPR/val` and `iwpod infer --input ...` accept
-  any directory of pairs, so the val split doubles as the eval set.
+- `iwpod eval --data datasets/LPR/val` walks scene subfolders the same way,
+  so the val split doubles as the eval set. `iwpod infer --input ...` is
+  flat by default (`--recursive` to walk nested dumps).

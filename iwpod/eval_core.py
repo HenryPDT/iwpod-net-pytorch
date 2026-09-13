@@ -19,9 +19,10 @@ import numpy as np
 import torch
 from loguru import logger
 
-from iwpod.constants import IMAGE_EXTS, is_real_plate
+from iwpod.constants import is_real_plate
 from iwpod.decode import decode_single
 from iwpod.preprocess import letterbox, unletterbox_quad
+from iwpod.utils import image_files_from_folder
 
 #: IoU thresholds for the accuracy curve (COCO-style 0.50-0.95 sweep).
 IOU_THRESHOLDS = tuple(round(t, 2) for t in np.arange(0.5, 1.0, 0.05))
@@ -80,13 +81,9 @@ def entries_from_annotated_dir(data_dir):
     is measurable; matches dataset.image_label_loader background policy.
     Malformed non-empty labels are skipped (not counted as negatives).
     """
-    files = []
-    if os.path.isdir(data_dir):
-        for name in os.listdir(data_dir):
-            if name.lower().endswith(IMAGE_EXTS):
-                files.append(os.path.join(data_dir, name))
+    files = image_files_from_folder(data_dir)
     entries = []
-    for jpg in sorted(files):
+    for jpg in files:
         txt = os.path.splitext(jpg)[0] + ".txt"
         if not os.path.isfile(txt):
             entries.append((jpg, None))

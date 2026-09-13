@@ -1,7 +1,6 @@
-"""Batch-1 regression tests: exact-count OHEM, EMA BN copy, tiny-scene val, seeding."""
+"""Batch-1 regression tests: exact-count OHEM, EMA BN copy, seeding."""
 from copy import deepcopy
 
-import cv2
 import numpy as np
 import torch
 
@@ -11,7 +10,6 @@ from iwpod.constants import NET_STRIDE, SIDE
 from iwpod.decode import decode_single
 from iwpod.loss import iwpodnet_loss_v2
 from iwpod.model import IWPODNet
-from iwpod.prepare import prepare_dataset
 
 
 def test_ohem_keeps_exact_count_on_ties():
@@ -41,19 +39,6 @@ def test_ema_copies_bn_stats():
         if isinstance(eb, torch.nn.BatchNorm2d):
             assert torch.equal(eb.running_mean, mb.running_mean)
             assert torch.equal(eb.running_var, mb.running_var)
-
-
-def test_prepare_tiny_scene_gets_val(tmp_path):
-    src = tmp_path / "raw" / "tiny"
-    src.mkdir(parents=True)
-    for i in range(3):
-        cv2.imwrite(str(src / f"f{i:03d}.jpg"), np.zeros((40, 60, 3), np.uint8))
-        (src / f"f{i:03d}.txt").write_text("4,0.1,0.4,0.4,0.1,0.2,0.2,0.5,0.5,car,\n")
-    out = tmp_path / "prep"
-    stats = prepare_dataset(str(tmp_path / "raw"), str(out), ratio=0.8, seed=0,
-                            image_reader=lambda p: (60, 40))
-    tiny = next(s for s in stats["scenes"] if s["scene"] == "tiny")
-    assert tiny["val"] >= 1 and tiny["train"] >= 1
 
 
 def test_seed_worker_deterministic():

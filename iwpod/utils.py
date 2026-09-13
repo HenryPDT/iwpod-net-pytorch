@@ -299,18 +299,20 @@ def nms(Labels,iou_threshold=.5):
 
 
 def image_files_from_folder(folder, upper=True):
-    """List images in `folder` by suffix-lowercasing (case-insensitive).
+    """List images under `folder` recursively (case-insensitive suffixes).
 
-    `upper` is kept for API compatibility and ignored: discovery is always
-    case-insensitive via IMAGE_EXTS.
+    Walks subdirectories so train/<scene>/*.jpg layouts work; a flat folder
+    still lists as before. `upper` is kept for API compatibility and ignored:
+    discovery is always case-insensitive via IMAGE_EXTS.
     """
     from iwpod.constants import IMAGE_EXTS
     if not os.path.isdir(folder):
         return []
     files = []
-    for name in os.listdir(folder):
-        if name.lower().endswith(IMAGE_EXTS):
-            files.append(os.path.join(folder, name))
+    for dirpath, _dirnames, names in os.walk(folder):
+        for name in names:
+            if name.lower().endswith(IMAGE_EXTS):
+                files.append(os.path.join(dirpath, name))
     return sorted(files)
 
 

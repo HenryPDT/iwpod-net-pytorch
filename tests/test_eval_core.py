@@ -49,6 +49,19 @@ def test_entries_from_annotated_dir(tmp_path):
     assert len(entries) == 1 and entries[0][1].shape == (2, 4)
 
 
+def test_entries_from_annotated_dir_nested(tmp_path):
+    import cv2
+    scene = tmp_path / "Access_Control"
+    scene.mkdir()
+    jpg = str(scene / "img.jpg")
+    cv2.imwrite(jpg, np.zeros((32, 32, 3), np.uint8))
+    with open(str(scene / "img.txt"), "w") as f:
+        f.write("4,0.2,0.2,0.8,0.2,0.8,0.8,0.2,0.8,\n")
+    entries = entries_from_annotated_dir(str(tmp_path))
+    assert len(entries) == 1 and entries[0][1].shape == (2, 4)
+    assert "Access_Control" in entries[0][0]
+
+
 class _NegModel(torch.nn.Module):
     def forward(self, x):
         b, _, h, w = x.shape

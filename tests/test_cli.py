@@ -5,7 +5,7 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("sub", ["prepare-data", "train", "eval", "infer", "export"])
+@pytest.mark.parametrize("sub", ["train", "eval", "infer", "export"])
 def test_cli_help(sub):
     r = subprocess.run([sys.executable, "-m", "iwpod", sub, "--help"],
                        capture_output=True, text=True, timeout=120)
@@ -17,7 +17,7 @@ def test_top_help_lists_subcommands():
     r = subprocess.run([sys.executable, "-m", "iwpod", "--help"],
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0
-    for sub in ("prepare-data", "train", "eval", "infer", "export"):
+    for sub in ("train", "eval", "infer", "export"):
         assert sub in r.stdout
 
 
