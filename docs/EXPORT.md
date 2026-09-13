@@ -2,20 +2,18 @@
 
 Export converts a `.pth` checkpoint to the ONNX the DeepStream stage consumes:
 NCHW `lpd_pred [B,7,Gh,Gw]` (ch0 = raw objectness **logits**, ch1..6 = affine).
-Phase 1 keeps a passthrough copy of the vehicle crop (`--with-passthrough`) for
-the legacy pipeline shape.
 
 **Train at 384 (multi-scale), deploy at 416.** Export at the deploy size.
+
+Do **not** use `--with-passthrough` for Conducive DeepStream. The IWPOD plugin
+letterboxes from `NvBufSurface`; classic WPOD keeps its own passthrough ONNX.
 
 ## Recipes
 
 ```bash
-# Standard: dynamic batch + dynamic shape, simplified (recommended default)
-iwpod export -w out/train/exp1/exp1_best.pth -s 416 --dynamic --dynamic-shape --simplify
-
-# Phase 1 DeepStream (legacy pipeline shape keeps its passthrough design)
+# DeepStream (recommended): dynamic batch + dynamic shape, simplified
 iwpod export -w out/train/exp1/exp1_best.pth -s 416 --dynamic --dynamic-shape \
-  --simplify --with-passthrough --check-parity -o iwpodv2_416_w_passthrough.onnx
+  --simplify --check-parity -o iwpod_416.onnx
 
 # Max-compat fallback for old TRT 8.5 stacks (validate with trtexec on target)
 iwpod export -w out/train/exp1/exp1_best.pth -s 384 --opset 13 --dynamic --simplify
@@ -26,7 +24,7 @@ iwpod export -w out/train/exp1/exp1_best.pth -s 384 --opset 13 --dynamic --simpl
 | Flag | Default | Meaning |
 |---|---|---|
 | `-w/--weights` | (required) | Input checkpoint (state dict or `{model_state_dict}`) |
-| `-s/--size` | `[416]` | `[H,W]` or single square; **must be multiples of `--align`**. 416 is the Xavier NX Phase-1 infer-dims |
+| `-s/--size` | `[416]` | `[H,W]` or single square; **must be multiples of `--align`**. 416 is the DeepStream `infer-dims` |
 | `--opset` | 17 | ONNX opset. 17 works on TRT 8.5 (DS 6.2) and TRT 10 (DS 9.1) for the 5 stable ops used here (Conv/Relu/MaxPool/Add/Concat). 13 is a fallback, not the default |
 | `--simplify` | off | Run `onnxslim` (recommended: smaller graph, same numerics) |
 | `--dynamic` | off | Dynamic batch axis (`batch`) |
@@ -34,7 +32,7 @@ iwpod export -w out/train/exp1/exp1_best.pth -s 384 --opset 13 --dynamic --simpl
 | `--batch` | 1 | Static batch used for the dummy trace (ignored with `--dynamic`) |
 | `--align` | 32 | H/W alignment enforced at export (covers stride-16 + TRT + future heads) |
 | `--with-sigmoid` | off | Bake sigmoid into the graph. Default (raw logits) is recommended: the DS parser applies sigmoid so the threshold stays runtime-tunable and INT8 calibration sees well-behaved activations |
-| `--with-passthrough` | off | LEGACY Phase-1: append `Identity(input→pass_through_output)` 2nd output for the old pipeline's crop-forwarding hack. Required by the deployed Phase-1 pipeline (`DOWNSTREAM_GUIDE.md`); omit for the clean Phase 2 design |
+| `--with-passthrough` | off | Leftover: append `Identity(input→pass_through_output)`. **Not used by Conducive IWPOD.** |
 | `--fuse` | off | Fold Conv-BN before export (opt-in; does not change default weights). Re-run `--check-parity` |
 | `--check-parity` | off | Compare torch vs ORT on a representative (non-zero) crop; with `--dynamic` also asserts batch-2 |
 | `-o/--output` | `<weights>.onnx` | Output path |
@@ -54,7 +52,7 @@ Verified in ORT: batch-2 runs from one file.
 python -c "import onnxruntime as ort
 s = ort.InferenceSession('model.onnx', providers=['CPUExecutionProvider'])
 print([(o.name, o.shape) for o in s.get_outputs()])"
-# expect lpd_pred [B,7,Gh,Gw] (+ pass_through_output [B,3,H,W] iff --with-passthrough)
+# expect lpd_pred [B,7,Gh,Gw] only
 ```
 
 Then compare against torch (`--check-parity`): representative `[0,1]` crop, not

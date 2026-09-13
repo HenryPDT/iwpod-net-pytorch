@@ -1,39 +1,25 @@
-// iwpod_reconstruct_v2.cpp — drop-in replacement for reconstructSingle()
-// in wpod_lpr_pipeline/ocr_preprocessor/nvdspreprocess_impl.cpp
+// iwpod_reconstruct.cpp — IWPOD grid decoder for nvdspreprocess_iwpod_impl.cpp
 //
-// WHAT: decodes the IWPOD-v2 raw tensor (NCHW [7,Gh,Gw]: ch0 = raw logits,
+// WHAT: decodes the IWPOD raw tensor (NCHW [7,Gh,Gw]: ch0 = raw logits,
 //       ch1..6 = affine) into plate quads + warpPerspective rectification.
 //       Also accepts the legacy WPOD layout (NHWC [Gh,Gw,8]: ch0 = prob,
-//       ch1 = bg, ch2..7 = affine) so old engines keep working.
+//       ch1 = bg, ch2..7 = affine).
 //
 // WHY REPLACE reconstructSingle: the old function has 5 latent bugs this fixes:
 //   1. x/y transposed indexing (wpod[x*W*D + y*D] treats NHWC as column-major;
 //      harmless only because the grid is square 25x25, wrong for 384px -> 24x24
-//      only if non-square ever used — v2 indexes both layouts correctly).
+//      only if non-square ever used — this indexes both layouts correctly).
 //   2. Affines copy reads Affines[x][y] but consumes Affines[y][x].
 //   3. abs() on doubles (int truncation) in the degenerate-size gate -> fabs.
 //   4. VLA double Affines[W][H][D-2] on stack -> std::vector.
 //   5. Hardcoded stride/side/threshold -> reconstructIwpod parameters
 //      (compile-time in the full TU; not DeepStream [user-configs]).
 //
-// HOW TO INSTALL (Phase 1, ~10 min, zero pipeline changes otherwise):
-//   1. Copy this file next to nvdspreprocess_impl.cpp and add it to the
-//      ocr_preprocessor/Makefile SOURCES (or #include it at the bottom of
-//      nvdspreprocess_impl.cpp — it only needs <vector> <algorithm> <cmath>
-//      and opencv, all already included there).
-//   2. In prepare_tensor(), replace the reconstructSingle(...) call with
-//      reconstructIwpod(...) — see the call-site patch in DOWNSTREAM_GUIDE.md.
-//   3. Keep everything else (JPEG/telemetry/buffer-hijack/LPR.cpp) UNTOUCHED.
-//      tensor_output[0..7] + return value keep the exact old contract.
-//
-// Compatible with the DLabel { double pts[2][4]; double prob; } already
-// defined in nvdspreprocess_impl.cpp — no header changes needed.
-//
-// NOTE: the full-pipeline rewrite (nvdspreprocess_iwpod_impl.cpp, same folder)
-// calls iwpod_v2::reconstructIwpod via iwpod_reconstruct_v2.h. This TU can also
-// be built standalone next to the old impl.cpp (see DOWNSTREAM_GUIDE.md §3).
+// Linked into libcustom_iwpod_ocr_preprocess.so with nvdspreprocess_iwpod_impl.cpp.
+// tensor_output[0..7] + return value keep the LPR.cpp quad/confidence contract.
+// JPEG packing lives in the impl TU (after 16 floats of lpd_pred).
 
-#include "iwpod_reconstruct_v2.h"
+#include "iwpod_reconstruct.h"
 
 #include <algorithm>
 #include <cmath>
@@ -41,7 +27,7 @@
 
 #include <opencv2/opencv.hpp>
 
-namespace iwpod_v2 {
+namespace iwpod {
 
 struct ScoredQuad {
     double qx[4], qy[4];
@@ -62,7 +48,7 @@ static inline double aabb_iou(double tlx1, double tly1, double brx1, double bry1
 }
 
 // pred: raw output pointer (host). Layout selected by is_nchw:
-//   NCHW v2: [C,Gh,Gw], C==7 (logit + affine6). from_logits=1.
+//   NCHW: [C,Gh,Gw], C==7 (logit + affine6). from_logits=1.
 //   NHWC legacy: [Gh,Gw,C], C==8 (prob + bg + affine6). from_logits=0.
 // in_w/in_h: SGIE input (infer-dims) in pixels. out_w/out_h: plate size (256x96).
 // Returns detection confidence (0.0 = none). tensor_output[0..3]=xs, [4..7]=ys
@@ -83,6 +69,7 @@ float reconstructIwpod(cv::Mat* output, float* tensor_output, const cv::Mat& ima
     } else {
         return 0.0f;  // unknown layout: refuse (fail-safe, no crash)
     }
+    (void)net_stride;
     auto at = [&](int c, int y, int x) -> double {
         return is_nchw ? pred[(c * Gh + y) * Gw + x] : pred[(y * Gw + x) * C + c];
     };
@@ -183,4 +170,4 @@ float reconstructIwpod(cv::Mat* output, float* tensor_output, const cv::Mat& ima
     return (float)best.conf;
 }
 
-}  // namespace iwpod_v2
+}  // namespace iwpod

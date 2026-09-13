@@ -3,7 +3,7 @@
 v2 default: single NCHW output `lpd_pred [B,7,Gh,Gw]` (raw logits + affine).
 `-s N` = NxN square; `-s H W` = non-square (allowed, accuracy-untested —
 training is square; the 256x96 plate is a separate warp stage, not this flag).
-Default size is 416 (Xavier NX Phase-1 infer-dims).
+Default size is 416 (DeepStream infer-dims).
 """
 import os
 
@@ -46,8 +46,7 @@ def register(p):
     leg = p.add_argument_group("legacy / compat")
     leg.add_argument("--with-sigmoid", action="store_true", help="Bake sigmoid into graph (default: raw logits)")
     leg.add_argument("--with-passthrough", action="store_true",
-                     help="LEGACY Phase-1: add Identity 2nd output (doubles host traffic; "
-                          "required by the deployed Phase-1 pipeline, omit for clean Phase-2)")
+                     help="Leftover: add Identity 2nd output. Not used by Conducive IWPOD.")
     p.set_defaults(func=run)
 
 
@@ -58,8 +57,7 @@ def _parity_input(batch, h, w, seed=0):
 
 
 class _Passthrough(nn.Module):
-    """Phase-1 helper: forward the input crop alongside the prediction so
-    the deployed pipeline can keep reading pixels from tensor output 1."""
+    """Optional Identity crop copy. Conducive IWPOD does not consume this."""
 
     def __init__(self, m):
         super().__init__()
@@ -155,7 +153,7 @@ def run(args):
     if names[0] != "lpd_pred":
         raise RuntimeError(f"Expected first output lpd_pred, got {names}")
     if args.with_passthrough and "pass_through_output" not in names:
-        raise RuntimeError("Phase-1 export missing pass_through_output")
+        raise RuntimeError("passthrough export missing pass_through_output")
     if args.check_parity:
         _check_parity(export_model, dummy, onnx_path)
         if args.dynamic:

@@ -1,34 +1,23 @@
 /*
- * nvdspreprocess_iwpod_impl.cpp — fast reimplementation of the WPOD
- * nvdspreprocess TU for IWPOD-v2.
+ * nvdspreprocess_iwpod_impl.cpp — IWPOD letterbox preprocess plugin TU.
  *
- * DROP-IN RULE: in ocr_preprocessor/Makefile replace
- *     SRCS:= ... nvdspreprocess_impl.cpp ...
- * with
- *     SRCS:= ... nvdspreprocess_iwpod_impl.cpp iwpod_reconstruct_v2.cpp ...
- * (copy this file + iwpod_reconstruct_v2.{h,cpp} from
- * iwpod-net-pytorch/deepstream/ into ocr_preprocessor/ first).
- * No changes to nvdspreprocess_lib.cpp, the Makefile otherwise, any config
- * (except the 3-line SGIE swap in DOWNSTREAM_GUIDE.md §2), LPR.cpp, or OCR.
+ * Linked into libcustom_iwpod_ocr_preprocess.so (Makefile). Classic WPOD
+ * passthrough is libcustom_wpod_ocr_preprocess.so from nvdspreprocess_impl.cpp.
+ * OCR still reads the NCHW plate tensor written here. LPD SGIE emits a single
+ * lpd_pred; vehicle pixels come from NvBufSurface. JPEG telemetry is packed
+ * after the first 16 floats of lpd_pred.
  *
- * REUSE vs REWRITE split:
- *  - Reused verbatim (NVIDIA boilerplate / pipeline contracts): CudaStream,
- *    CudaDeviceBuffer, setters, mean-file/resource/stream handling, initLib
- *    entry, tensor-meta lookup, cpuPtr reuse, image_info_map send gating,
- *    JPEG telemetry blocks, buffer-hijack layout (wpod[0..10]), rect flash.
- *  - Rewritten (hot path, runs per vehicle per frame): grid decode
- *    (via iwpod_v2::reconstructIwpod: no full-grid Affines copy, no VLA,
- *    correct NCHW indexing, top-k + NMS) and the CHW interleave write
- *    (row-pointer planar memcpy instead of per-pixel .at<Vec3f>).
- *
- * Contracts preserved byte-for-byte: tensor_output[0..7] quad pixels,
+ * Contracts: tensor_output[0..7] quad pixels in letterbox space,
  * wpod[8]=confidence, wpod[9]=jpeg bytes, wpod[10]=is-plate, OCR tensor
  * NCHW float [0,1] via pixel_val*255*m_Scale (fused to one multiply).
  */
 
+#include "nvdspreprocess_impl.h"
+
 #include <cuda.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <gst/gst.h>
 
 #include <array>
 #include <cstring>
@@ -37,6 +26,7 @@
 #include <iterator>
 #include <memory>
 #include <sstream>
+#include <vector>
 #include <opencv2/opencv.hpp>
 
 #include "gstnvdsinfer.h"
@@ -44,19 +34,21 @@
 #include "nvdsmeta.h"
 #include "nvdspreprocess_conversion.h"
 #include "nvtx3/nvToolsExtCudaRt.h"
+#include "nvbufsurface.h"
+#include "nvbufsurftransform.h"
 
-#include "nvdspreprocess_impl.h"
-#include "iwpod_reconstruct_v2.h"
+#include "iwpod_reconstruct.h"
 
 using namespace cv;
 using namespace std;
 
-// ---- IWPOD-v2 decode parameters (must match training + export) ------------
+// ---- IWPOD decode parameters (must match training + export) ---------------
 static constexpr double kNetStride = 16.0;
 static constexpr double kSide = ((208.0 + 40.0) / 2.0) / kNetStride;  // 7.75
 static constexpr float kMinConfidence = 0.3f;  // mirrors runtime wpod_threshold default
 static constexpr int kTopK = 1;                // 1 reproduces old max-only behavior
 static constexpr double kNmsIou = 0.25;
+static constexpr int kJpegFloatOffset = 16;
 // ---------------------------------------------------------------------------
 
 CudaStream::CudaStream(uint flag, int priority) {
@@ -262,38 +254,165 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::syncStream() {
     return NVDSPREPROCESS_SUCCESS;
 }
 
-// Convert Phase-1 passthrough (NCHW [3,H,W] or legacy HWC [H,W,3]) to HWC
-// float interleaved for cv::Mat(H, W, CV_32FC3). Fail closed on unknown layout.
-static bool passthrough_to_hwc(const float* src, const unsigned* d, int num_dims,
-                               std::vector<float>& hwc, int& out_h, int& out_w) {
-    if (src == nullptr || d == nullptr || num_dims < 3) return false;
-    const int d0 = (int)d[0], d1 = (int)d[1], d2 = (int)d[2];
-    const bool nchw = (d0 == 3 && d2 != 3);  // [3, H, W]
-    const bool hwc_layout = (d2 == 3);       // [H, W, 3]
-    if (nchw) {
-        out_h = d1;
-        out_w = d2;
-        if (out_h <= 0 || out_w <= 0) return false;
-        hwc.resize((size_t)out_h * (size_t)out_w * 3);
-        const size_t plane = (size_t)out_h * (size_t)out_w;
-        for (int c = 0; c < 3; ++c) {
-            for (int y = 0; y < out_h; ++y) {
-                for (int x = 0; x < out_w; ++x) {
-                    hwc[((size_t)y * out_w + x) * 3 + c] =
-                            src[(size_t)c * plane + (size_t)y * out_w + x];
-                }
-            }
-        }
+// Match nvinfer GST_ROUND_UP_2 / GST_ROUND_DOWN_2 used for SGIE object crops.
+static inline unsigned round_up2(unsigned v) {
+    return (v + 1u) & ~1u;
+}
+static inline unsigned round_down2(unsigned v) {
+    return v & ~1u;
+}
+
+static bool ensure_letterbox_surf(
+        NvBufSurface*& surf,
+        int& cur_w,
+        int& cur_h,
+        int net_w,
+        int net_h,
+        uint32_t gpu_id) {
+    if (surf && cur_w == net_w && cur_h == net_h) {
         return true;
     }
-    if (hwc_layout) {
-        out_h = d0;
-        out_w = d1;
-        if (out_h <= 0 || out_w <= 0) return false;
-        hwc.assign(src, src + (size_t)out_h * (size_t)out_w * 3);
-        return true;
+    if (surf) {
+        NvBufSurfaceDestroy(surf);
+        surf = nullptr;
+        cur_w = 0;
+        cur_h = 0;
     }
-    return false;
+    NvBufSurfaceCreateParams create_params = {};
+    create_params.gpuId = gpu_id;
+    create_params.width = net_w;
+    create_params.height = net_h;
+    create_params.size = 0;
+    create_params.colorFormat = NVBUF_COLOR_FORMAT_RGBA;
+    create_params.layout = NVBUF_LAYOUT_PITCH;
+#ifdef __aarch64__
+    create_params.memType = NVBUF_MEM_DEFAULT;
+#else
+    create_params.memType = NVBUF_MEM_CUDA_UNIFIED;
+#endif
+    if (NvBufSurfaceCreate(&surf, 1, &create_params) != 0 || !surf) {
+        printf("IWPOD failed to allocate %dx%d letterbox surface\n", net_w, net_h);
+        surf = nullptr;
+        return false;
+    }
+    cur_w = net_w;
+    cur_h = net_h;
+    return true;
+}
+
+// Crop vehicle bbox from the frame surface and letterbox top-left into net_w x
+// net_h RGB float [0,1], matching nvinfer maintain-aspect-ratio without
+// symmetric-padding (right/bottom pad).
+static bool letterbox_vehicle_rgb(
+        NvBufSurface* in_surf,
+        NvBufSurfaceParams* src_params,
+        const NvOSD_RectParams& bbox,
+        NvBufSurface*& letterbox_surf,
+        int& letterbox_w,
+        int& letterbox_h,
+        int net_w,
+        int net_h,
+        cudaStream_t stream,
+        cv::Mat& rgb01) {
+    if (!in_surf || !src_params || net_w <= 0 || net_h <= 0) {
+        return false;
+    }
+    if (!ensure_letterbox_surf(
+                letterbox_surf,
+                letterbox_w,
+                letterbox_h,
+                net_w,
+                net_h,
+                in_surf->gpuId)) {
+        return false;
+    }
+
+    unsigned src_left = round_up2((unsigned)bbox.left);
+    unsigned src_top = round_up2((unsigned)bbox.top);
+    unsigned src_width = round_down2((unsigned)bbox.width);
+    unsigned src_height = round_down2((unsigned)bbox.height);
+    if (src_left >= src_params->width || src_top >= src_params->height) {
+        return false;
+    }
+    if (src_left + src_width > src_params->width) {
+        src_width = src_params->width - src_left;
+        src_width = round_down2(src_width);
+    }
+    if (src_top + src_height > src_params->height) {
+        src_height = src_params->height - src_top;
+        src_height = round_down2(src_height);
+    }
+    if (src_width < 2 || src_height < 2) {
+        return false;
+    }
+
+    unsigned dest_width = (unsigned)net_w;
+    unsigned dest_height = (unsigned)net_h;
+    const double hdest = (double)net_w * src_height / (double)src_width;
+    const double wdest = (double)net_h * src_width / (double)src_height;
+    if (hdest <= (double)net_h) {
+        dest_width = (unsigned)net_w;
+        dest_height = (unsigned)hdest;
+    } else {
+        dest_width = (unsigned)wdest;
+        dest_height = (unsigned)net_h;
+    }
+    if (dest_width < 1) dest_width = 1;
+    if (dest_height < 1) dest_height = 1;
+    if (dest_width > (unsigned)net_w) dest_width = (unsigned)net_w;
+    if (dest_height > (unsigned)net_h) dest_height = (unsigned)net_h;
+
+    NvBufSurface src_wrap = {};
+    src_wrap.gpuId = in_surf->gpuId;
+    src_wrap.batchSize = 1;
+    src_wrap.numFilled = 1;
+    src_wrap.memType = in_surf->memType;
+    src_wrap.isContiguous = in_surf->isContiguous;
+    src_wrap.surfaceList = src_params;
+
+    NvBufSurfTransformConfigParams cfg = {};
+    cfg.compute_mode = NvBufSurfTransformCompute_GPU;
+    cfg.gpu_id = in_surf->gpuId;
+    cfg.cuda_stream = stream;
+    NvBufSurfTransform_Error err = NvBufSurfTransformSetSessionParams(&cfg);
+    if (err != NvBufSurfTransformError_Success) {
+        printf("IWPOD NvBufSurfTransformSetSessionParams failed (%d)\n", (int)err);
+        return false;
+    }
+    NvBufSurfaceMemSet(letterbox_surf, 0, 0, 0);
+
+    NvBufSurfTransformRect src_rect = {src_top, src_left, src_width, src_height};
+    NvBufSurfTransformRect dst_rect = {0, 0, dest_width, dest_height};
+    NvBufSurfTransformParams tp = {};
+    tp.src_rect = &src_rect;
+    tp.dst_rect = &dst_rect;
+    tp.transform_flag = NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_SRC |
+                        NVBUFSURF_TRANSFORM_CROP_DST;
+    tp.transform_flip = NvBufSurfTransform_None;
+    tp.transform_filter = NvBufSurfTransformInter_Default;
+    err = NvBufSurfTransform(&src_wrap, letterbox_surf, &tp);
+    if (err != NvBufSurfTransformError_Success) {
+        printf("IWPOD NvBufSurfTransform failed (%d)\n", (int)err);
+        return false;
+    }
+
+    if (NvBufSurfaceMap(letterbox_surf, 0, 0, NVBUF_MAP_READ) != 0) {
+        printf("IWPOD letterbox NvBufSurfaceMap failed\n");
+        return false;
+    }
+    NvBufSurfaceSyncForCpu(letterbox_surf, 0, 0);
+    NvBufSurfaceParams& dst = letterbox_surf->surfaceList[0];
+    if (!dst.mappedAddr.addr[0]) {
+        NvBufSurfaceUnMap(letterbox_surf, 0, 0);
+        printf("IWPOD letterbox mapped address is null\n");
+        return false;
+    }
+    cv::Mat rgba(net_h, net_w, CV_8UC4, dst.mappedAddr.addr[0], dst.pitch);
+    cv::Mat rgb8;
+    cv::cvtColor(rgba, rgb8, cv::COLOR_RGBA2RGB);
+    rgb8.convertTo(rgb01, CV_32FC3, 1.0 / 255.0);
+    NvBufSurfaceUnMap(letterbox_surf, 0, 0);
+    return !rgb01.empty();
 }
 
 // Fast HWC-float32 -> CHW-planar write with fused scale.
@@ -321,6 +440,16 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::prepare_tensor(
     unsigned out_size[3] = {m_NetworkSize.width, m_NetworkSize.height, m_NetworkSize.channels};
     const float norm_k = 255.0f * m_Scale;  // fused: old (v*255)*m_Scale == v*k
 
+    GstMapInfo in_map = {};
+    NvBufSurface* in_surf = nullptr;
+    bool mapped_in = false;
+    if (batch->inbuf && gst_buffer_map(batch->inbuf, &in_map, GST_MAP_READ)) {
+        mapped_in = true;
+        in_surf = (NvBufSurface*)in_map.data;
+    }
+
+    cudaStream_t stream = m_PreProcessStream ? m_PreProcessStream->ptr() : nullptr;
+
     /* For each frame in the input batch convert/copy to the input binding
      * buffer. */
     for (unsigned int i = 0; i < batch_size; i++) {
@@ -340,18 +469,15 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::prepare_tensor(
                     if (tensor_meta->unique_id != (guint)m_WpodUniqueID) {
                         continue;
                     }
-                    if (tensor_meta->numOutputLayers < 2) {
-                        printf("IWPOD Phase-1 requires passthrough output[1]; skipping object\n");
+                    if (tensor_meta->num_output_layers < 1) {
+                        printf("IWPOD missing lpd_pred output; skipping object\n");
                         break;
                     }
-                    const NvDsInferDims& pass_dims = tensor_meta->output_layers_info[1].inferDims;
                     const NvDsInferDims& pred_inf = tensor_meta->output_layers_info[0].inferDims;
-                    if (pass_dims.numDims < 3 || pred_inf.numDims < 3) {
-                        printf("IWPOD unexpected rank pred=%u pass=%u; skipping\n",
-                               pred_inf.numDims, pass_dims.numDims);
+                    if (pred_inf.numDims < 3) {
+                        printf("IWPOD unexpected lpd_pred rank=%u; skipping\n", pred_inf.numDims);
                         break;
                     }
-                    unsigned* in_size = tensor_meta->output_layers_info[1].inferDims.d;
                     unsigned* pred_dims = tensor_meta->output_layers_info[0].inferDims.d;
                     int vC, vGh, vGw;
                     bool vNCHW, vLogits;
@@ -369,28 +495,42 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::prepare_tensor(
                         vLogits = (vC == 7);
                     } else {
                         printf("IWPOD unknown lpd_pred layout [%u,%u,%u]; skipping\n",
-                               pred_dims[0], pred_dims[1], pred_dims[2]);
+                               pred_dims[0],
+                               pred_dims[1],
+                               pred_dims[2]);
                         break;
                     }
                     float* wpod = (float*)tensor_meta->out_buf_ptrs_host[0];
-                    float* cropped_image = (float*)tensor_meta->out_buf_ptrs_host[1];
-                    if (!wpod || !cropped_image) {
-                        printf("IWPOD missing host tensor pointers; skipping\n");
+                    if (!wpod) {
+                        printf("IWPOD missing host tensor pointer; skipping\n");
                         break;
                     }
-                    std::vector<float> hwc;
-                    int pass_h = 0, pass_w = 0;
-                    if (!passthrough_to_hwc(cropped_image, in_size, (int)pass_dims.numDims,
-                                            hwc, pass_h, pass_w)) {
-                        printf("IWPOD passthrough layout not NCHW[3,H,W] or HWC[H,W,3]; skipping\n");
+                    const int net_w = vGw * (int)kNetStride;
+                    const int net_h = vGh * (int)kNetStride;
+                    NvBufSurfaceParams* src_params = batch->units[i].input_surf_params;
+                    if (!in_surf || !src_params) {
+                        printf("IWPOD missing NvBufSurface for vehicle crop; skipping\n");
+                        break;
+                    }
+                    cv::Mat image;
+                    if (!letterbox_vehicle_rgb(
+                                in_surf,
+                                src_params,
+                                batch->units[i].obj_meta->rect_params,
+                                m_LetterboxSurf,
+                                m_LetterboxW,
+                                m_LetterboxH,
+                                net_w,
+                                net_h,
+                                stream,
+                                image)) {
+                        printf("IWPOD letterbox crop failed; skipping object\n");
                         break;
                     }
                     float pts[8];
-                    cv::Mat image = cv::Mat(pass_h, pass_w, CV_32FC3, hwc.data()).clone();
                     Mat image_output =
                             cv::Mat(out_size[1], out_size[0], CV_32FC3, cv::Scalar(0, 0, 0));
-                    const size_t ocr_elems =
-                            (size_t)out_size[0] * out_size[1] * out_size[2];
+                    const size_t ocr_elems = (size_t)out_size[0] * out_size[1] * out_size[2];
                     if (cpuPtr && ptrSize < ocr_elems) {
                         delete[] cpuPtr;
                         cpuPtr = nullptr;
@@ -405,7 +545,7 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::prepare_tensor(
                     }
                     memset(cpuPtr, 0, ocr_elems * sizeof(float));
 
-                    // WPOD output is RGB. Convert if the network requires a different
+                    // IWPOD crop is RGB. Convert if the OCR network requires a different
                     // format.
                     if (m_NetworkInputFormat == NvDsPreProcessFormat_BGR) {
                         cv::cvtColor(image, image, cv::COLOR_RGB2BGR);
@@ -413,36 +553,41 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::prepare_tensor(
                         cv::cvtColor(image, image, cv::COLOR_RGB2GRAY);
                     }
 
-                    float confidence = iwpod_v2::reconstructIwpod(
-                            &image_output, pts, image, wpod, vC, vGh, vGw, vNCHW,
-                            pass_w, pass_h, (int)out_size[0],
-                            (int)out_size[1], kNetStride, kSide, kMinConfidence,
-                            vLogits, kTopK, kNmsIou);
+                    float confidence = iwpod::reconstructIwpod(
+                            &image_output,
+                            pts,
+                            image,
+                            wpod,
+                            vC,
+                            vGh,
+                            vGw,
+                            vNCHW,
+                            net_w,
+                            net_h,
+                            (int)out_size[0],
+                            (int)out_size[1],
+                            kNetStride,
+                            kSide,
+                            kMinConfidence,
+                            vLogits,
+                            kTopK,
+                            kNmsIou);
                     if (confidence < kMinConfidence) {
-                        // Set to 0
                         for (int c = 0; c <= 15; c++) {
                             wpod[c] = 0.0;
                         }
                         break;
                     }
 
-                    // This part is about whether to send a vehicle or plate image for
-                    // this object
                     int object_id = batch->units[i].obj_meta->object_id;
-                    // We store whether we have already sent an image (and the confidence
-                    // in that image here)
                     auto& inner_map = image_info_map[batch->units[i].frame_meta->source_id];
                     auto obj_itr = inner_map.find(object_id);
-                    // Whether we want to send it
                     bool send_plate = false;
                     bool send_vehicle = false;
-                    ImageInfo* info;
+                    ImageInfo* info = nullptr;
                     if (!disable_images) {
                         if (obj_itr != inner_map.end()) {
-                            // The object_id exists within the source_id map
                             info = &(obj_itr->second);
-                            // If we are far more confidence in this new image and have sent 1
-                            // in the last 4 frame send it
                             if (info->plate_confidence + 0.1 < confidence &&
                                 batch->units[i].frame_meta->frame_num - info->last_plate_sent > 4) {
                                 send_plate = true;
@@ -454,55 +599,37 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::prepare_tensor(
                                 send_vehicle = true;
                             }
                         } else {
-                            // Havent seen this object before
-                            // Delete from our map if we have more than 16 stored (they are
-                            // likely gone anyways)
                             if (inner_map.size() > 16) {
-                                // Erase the first element (which has the lowest object_id)
                                 inner_map.erase(inner_map.begin());
                             }
-
                             info = &(image_info_map[batch->units[i].frame_meta->source_id]
                                                    [object_id]);
                             info->last_plate_sent = 0;
                             info->plate_confidence = 0;
                             info->last_vehicle_sent = 0;
                             info->vehicle_confidence = 0;
-                            // Send the plate on the first time we see it
                             send_plate = true;
                         }
                     }
                     std::vector<uchar> jpegData;
 
-                    // This must be before copying the plate to the cpuPtr as it uses the
-                    // same memory
                     if (send_vehicle) {
-                        // Since image has black bar at the bottom we want to crop that out
-                        // so we do that here
-                        int blackBarStartRow = -1;
-                        for (int r = image.rows - 1; r >= 0; r--) {
-                            cv::Vec3b pixel = image.at<cv::Vec3b>(r, image.cols / 2);
+                        cv::Mat vehicle8;
+                        image.convertTo(vehicle8, CV_8UC3, 255.0);
+                        int blackBarStartRow = vehicle8.rows;
+                        for (int r = vehicle8.rows - 1; r >= 0; r--) {
+                            cv::Vec3b pixel = vehicle8.at<cv::Vec3b>(r, vehicle8.cols / 2);
                             if (pixel == cv::Vec3b(0, 0, 0)) {
                                 blackBarStartRow = r;
                             } else {
                                 break;
                             }
                         }
-                        // Image pixels are 0.0-1.0 but we need them to be 0-255 so multiple
-                        // that here
-                        image = image * 255;
-                        // Convert to 8bit instead of float
-                        image.convertTo(image, CV_8UC3);
-                        // Sometimes it doesnt work out cropping so we just do the whole
-                        // image with black bars
                         if (blackBarStartRow <= 10) {
-                            blackBarStartRow = image.rows;
+                            blackBarStartRow = vehicle8.rows;
                         }
-                        // Crop the image
-                        cv::Rect regionOfInterest(0, 0, image.cols, blackBarStartRow);
-                        cv::Mat croppedImage = image(regionOfInterest);
-                        // Calculate the scaling factor to resize the image to have a
-                        // maximum height of 50 pixels
+                        cv::Rect regionOfInterest(0, 0, vehicle8.cols, blackBarStartRow);
+                        cv::Mat croppedImage = vehicle8(regionOfInterest);
                         double scale = std::min(50.0 / croppedImage.rows, 1.0);
                         if (scale < 1.0) {
                             cv::Size newSize(croppedImage.cols * scale, croppedImage.rows * scale);
@@ -513,19 +640,14 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::prepare_tensor(
                         info->last_vehicle_sent = batch->units[i].frame_meta->frame_num;
                     }
 
-                    // The number of channels depends on the final network format (e.g., 1
-                    // for GRAY, 3 for RGB/BGR)
                     int channels_to_copy = image_output.channels();
                     if (m_NetworkInputFormat == NvDsPreProcessFormat_GRAY) {
                         channels_to_copy = 1;
                     }
 
-                    // FAST PATH (rewritten): planar write via row pointers.
-                    // Old code did channels×rows×cols .at<Vec3f> lookups here.
                     if (channels_to_copy == 3 && image_output.isContinuous()) {
                         write_planar_fast(image_output, cpuPtr, 3, norm_k);
                     } else {
-                        // Slow generic path (GRAY or non-continuous, same values).
                         for (int c = 0; c < channels_to_copy; c++) {
                             for (int h = 0; h < image_output.rows; h++) {
                                 for (int w = 0; w < image_output.cols; w++) {
@@ -542,15 +664,9 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::prepare_tensor(
                             }
                         }
                     }
-                    // For some reason this has to be after copying to the cpuPtr
                     if (send_plate) {
-                        // Image pixels are 0.0-1.0 but we need them to be 0-255 so multiple
-                        // that here
                         image_output = image_output * 255;
-                        // Convert from float to integers
                         image_output.convertTo(image_output, CV_8UC3);
-                        // Resize to a quart of the original size (256/4, 96/4) to save
-                        // memory
                         cv::Size newSize(image_output.cols / 2, image_output.rows / 2);
                         cv::resize(image_output, image_output, newSize);
                         cv::imencode(".jpg", image_output, jpegData);
@@ -558,50 +674,45 @@ NvDsPreProcessStatus NvDsPreProcessTensorImpl::prepare_tensor(
                         info->last_plate_sent = batch->units[i].frame_meta->frame_num;
                     }
 
-                    // Copy the converted image to the output
                     cudaMemcpy(
                             outPtr,
                             cpuPtr,
                             out_size[0] * out_size[1] * out_size[2] * sizeof(float),
                             cudaMemcpyHostToDevice);
-                    // We replace the first 8 values of the wpod raw output for display
                     for (int c = 0; c < 8; c++) {
                         wpod[c] = pts[c];
                     }
 
                     wpod[8] = confidence;
-                    // So we know the size of the output/ whether there is data there
                     wpod[9] = jpegData.size();
-                    // So we know whether this is a plate or a vehicle
                     wpod[10] = send_plate;
-                    // Since the memory is just a pointer to some memory we can recast it
-                    // to a uchar (1 byte) and copy the image data there
-                    uchar* image_data = (uchar*)tensor_meta->out_buf_ptrs_host[1];
-                    // Copy the image into the existing wpod buffer as uchar
-                    // Check to see that our image will fit since we have scaled images
-                    // this should always fit But good to check anyways
-                    if (0 < jpegData.size() &&
-                        jpegData.size() * sizeof(uchar) <
-                                (in_size[0] * in_size[1] * in_size[2]) * sizeof(float)) {
+                    const unsigned long pred_n =
+                            (unsigned long)pred_dims[0] * pred_dims[1] * pred_dims[2];
+                    const unsigned long jpeg_cap =
+                            pred_n > (unsigned long)kJpegFloatOffset
+                                    ? (pred_n - (unsigned long)kJpegFloatOffset) * sizeof(float)
+                                    : 0;
+                    uchar* image_data = (uchar*)(wpod + kJpegFloatOffset);
+                    if (0 < jpegData.size() && jpegData.size() * sizeof(uchar) < jpeg_cap) {
                         memcpy(image_data, jpegData.data(), jpegData.size() * sizeof(uchar));
-                        // Flash the bbox to white for vehicle image and blue for plate
-                        // image
                         batch->units[i].obj_meta->rect_params.has_bg_color = true;
                         batch->units[i].obj_meta->rect_params.bg_color.red =
                                 send_vehicle ? 1.0 : 0.0;
                         batch->units[i].obj_meta->rect_params.bg_color.blue = 1.0;
                         batch->units[i].obj_meta->rect_params.bg_color.green =
                                 send_vehicle ? 1.0 : 0.0;
-                        ;
                         batch->units[i].obj_meta->rect_params.bg_color.alpha = 0.3;
                     } else {
-                        // Signal for whether there is no image data stored
                         wpod[9] = 0;
                     }
                     break;
                 }
             }
         }
+    }
+
+    if (mapped_in) {
+        gst_buffer_unmap(batch->inbuf, &in_map);
     }
 
     return NVDSPREPROCESS_SUCCESS;

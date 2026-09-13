@@ -23,7 +23,7 @@
 | Symptom | Cause → Fix |
 |---|---|
 | `No Adapter From Version $16 for Identity` with `--opset 13` | Known torch-exporter notice; file still validates + runs in ORT. Confirm with `trtexec` on the DS 6.2 box; prefer opset 17 |
-| TRT engine fails to parse | Check opset (17 default), confirm single `lpd_pred` output (or +passthrough iff Phase 1), rebuild **on the target** — engines aren't portable |
+| TRT engine fails to parse | Check opset (17 default), confirm single `lpd_pred` output, rebuild **on the target** — engines aren't portable |
 | First DeepStream run hangs for minutes | Normal: engine building. Keep the `.engine` file next to the `.onnx` |
 | `wpod_confidence` distribution shifts after FP16/INT8 | Re-run `iwpod eval` thresholds on the quantized engine; gate per EVALUATION.md |
 

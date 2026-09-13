@@ -58,7 +58,7 @@ Runs land in `out/train/<name>[_2..]` with checkpoints, `train_command.txt`,
 | `docs/EXPORT.md` | Flag matrix, per-target recipes, validation, TensorRT |
 | `docs/EVALUATION.md` | Metric definitions, reading numbers, gating |
 | `docs/TROUBLESHOOTING.md` | GPU env, training, export, detection symptoms |
-| `deepstream/DOWNSTREAM_GUIDE.md` | DeepStream rollout (Phase 1/2), patch, configs |
+| `deepstream/DOWNSTREAM_GUIDE.md` | DeepStream IWPOD export, plugin contract, rollback |
 
 > **NoMachine/NX + cuDNN (fixed permanently):** NX injects
 > `LD_PRELOAD=/usr/NX/lib/libnxegl.so` into every session, which breaks cuDNN
